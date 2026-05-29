@@ -1,0 +1,6 @@
+include README.md
+include LICENSE
+include pyproject.toml
+include setup.py
+include motor_install_hook.py
+global-exclude *.py[cod] __pycache__ .DS_Store
