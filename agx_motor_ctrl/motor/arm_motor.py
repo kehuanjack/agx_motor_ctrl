@@ -1,375 +1,40 @@
-"""电机控制 Python 封装（ctypes + libmotor）。"""
-import os
-import sys
-import time
+"""机械臂关节电机 Python 封装（ctypes + libmotor_arm）。"""
 from enum import Enum
+from typing import Any, Callable, Optional, Union
+
 from ctypes import (
-    CDLL,
-    CFUNCTYPE,
-    POINTER,
-    Structure,
     byref,
     cast,
     c_float,
     c_int,
-    c_int8,
-    c_int16,
     c_uint8,
     c_uint32,
     c_uint64,
-    c_void_p,
+    POINTER,
 )
-from pathlib import Path
-from typing import Any, Callable, List, NamedTuple, Optional, Union
-
 from can.message import Message
 
 from agx_motor_ctrl.comm.can_comm import CanComm
-
-TX_FN = CFUNCTYPE(c_int, c_void_p, c_uint32, POINTER(c_uint8), c_uint8)  # libmotor 发送回调类型
-TxCallback = Callable[[Any, int, Any, int], int]  # TX_FN 实例的类型注解
-
-_motor_lib: Optional[CDLL] = None
-_motor_lib_error: Optional[BaseException] = None
-
-
-class _MotorHighSpeedFeedback(Structure):
-    """ctypes：高速反馈结构体。"""
-
-    _fields_ = [
-        ("position", c_float),
-        ("velocity", c_float),
-        ("current", c_float),
-        ("timestamp_ns", c_uint64),
-    ]
-
-
-class _MotorDriverStatusBits(Structure):
-    """ctypes：驱动器状态位结构体。"""
-
-    _fields_ = [
-        ("undervoltage", c_uint8),
-        ("motor_overtemp", c_uint8),
-        ("driver_overcurrent", c_uint8),
-        ("driver_overtemp", c_uint8),
-        ("collision_tripped", c_uint8),
-        ("driver_error", c_uint8),
-        ("enabled", c_uint8),
-        ("stall_tripped", c_uint8),
-    ]
-
-
-class _MotorLowSpeedFeedback(Structure):
-    """ctypes：低速反馈结构体。"""
-
-    _fields_ = [
-        ("bus_voltage_v", c_float),
-        ("driver_temp_deg", c_int16),
-        ("motor_temp_deg", c_int8),
-        ("_pad0", c_uint8),
-        ("bus_current", c_float),
-        ("status_raw", c_uint8),
-        ("status", _MotorDriverStatusBits),
-        ("_pad_tail", c_uint8 * 3),
-        ("timestamp_ns", c_uint64),
-    ]
-
-
-class _MotorVersionInfo(Structure):
-    """ctypes：版本信息结构体。"""
-
-    _fields_ = [
-        ("software", c_uint8 * 64),
-        ("hardware", c_uint8 * 64),
-        ("motor", c_uint8 * 64),
-        ("timestamp_ns", c_uint64),
-    ]
-
-
-class DriverStatus(NamedTuple):
-    """驱动器状态位（由低速反馈 ``status_raw`` 按位解码）。
-
-    成员
-    ----
-    undervoltage : bool
-        欠压告警。
-    motor_overtemp : bool
-        电机过温告警。
-    driver_overcurrent : bool
-        驱动器过流告警。
-    driver_overtemp : bool
-        驱动器过温告警。
-    collision_tripped : bool
-        碰撞保护已触发。
-    driver_error : bool
-        驱动器错误（具体含义以固件为准）。
-    enabled : bool
-        驱动器使能状态指示。
-    stall_tripped : bool
-        堵转保护已触发。
-    """
-
-    undervoltage: bool
-    motor_overtemp: bool
-    driver_overcurrent: bool
-    driver_overtemp: bool
-    collision_tripped: bool
-    driver_error: bool
-    enabled: bool
-    stall_tripped: bool
-
-
-class HighSpeedFeedback(NamedTuple):
-    """高速反馈快照（由 :meth:`Motor.get_high_speed_feedback` 返回）。
-
-    成员
-    ----
-    position : float
-        关节位置 [rad]。
-    velocity : float
-        关节角速度 [rad/s]。
-    current : float
-        相电流 [A]。
-    timestamp : float
-        本条反馈的时间戳 [s]，ns precision。
-    """
-
-    position: float
-    velocity: float
-    current: float
-    timestamp: float
-
-
-class LowSpeedFeedback(NamedTuple):
-    """低速补充反馈快照（由 :meth:`Motor.get_low_speed_feedback` 返回）。
-
-    成员
-    ----
-    bus_voltage_v : float
-        母线电压 [V]。
-    driver_temp_deg : int
-        驱动器温度 [°C]。
-    motor_temp_deg : int
-        电机温度 [°C]。
-    bus_current : float
-        母线电流 [A]。
-    status_raw : int
-        原始状态字节（0–255），与 ``status`` 各布尔位一一对应。
-    status : DriverStatus
-        由 ``status_raw`` 解码后的状态位集合。
-    timestamp : float
-        本条反馈的时间戳 [s]，ns precision。
-    """
-
-    bus_voltage_v: float
-    driver_temp_deg: int
-    motor_temp_deg: int
-    bus_current: float
-    status_raw: int
-    status: DriverStatus
-    timestamp: float
-
-
-class VersionInfo(NamedTuple):
-    """版本信息（由 :meth:`Motor.get_version` 阻塞查询返回）。
-
-    成员
-    ----
-    software : str
-        软件版本字符串，例如 ``"v1.2.3"``。
-    hardware : str
-        硬件版本字符串，例如 ``"v1.0.0"``。
-    motor : str
-        电机型号/版本字符串，例如 ``"v2.1.0"``。
-    timestamp : float
-        版本应答的时间戳 [s]，ns precision。
-    """
-
-    software: str
-    hardware: str
-    motor: str
-    timestamp: float
-
-
-def _ns_to_timestamp(ns: int) -> float:
-    # ns -> s [s], ns precision
-    return int(ns) * 1e-9
-
-
-def _timestamp_to_ns(timestamp: float) -> int:
-    # s -> ns
-    return int(round(timestamp * 1e9))
-
-
-def _c_string(buf: bytes) -> str:
-    # 从 C 字符串缓冲区解码为 Python str
-    return buf.split(b"\x00", 1)[0].decode("ascii", "replace")
-
-
-def _driver_status_from_ctypes(raw: _MotorDriverStatusBits) -> DriverStatus:
-    # ctypes 状态位转 DriverStatus
-    return DriverStatus(
-        undervoltage=bool(raw.undervoltage),
-        motor_overtemp=bool(raw.motor_overtemp),
-        driver_overcurrent=bool(raw.driver_overcurrent),
-        driver_overtemp=bool(raw.driver_overtemp),
-        collision_tripped=bool(raw.collision_tripped),
-        driver_error=bool(raw.driver_error),
-        enabled=bool(raw.enabled),
-        stall_tripped=bool(raw.stall_tripped),
-    )
-
-
-def _high_speed_from_ctypes(raw: _MotorHighSpeedFeedback) -> HighSpeedFeedback:
-    # ctypes 高速反馈转 HighSpeedFeedback
-    return HighSpeedFeedback(
-        position=float(raw.position),
-        velocity=float(raw.velocity),
-        current=float(raw.current),
-        timestamp=_ns_to_timestamp(raw.timestamp_ns),
-    )
-
-
-def _low_speed_from_ctypes(raw: _MotorLowSpeedFeedback) -> LowSpeedFeedback:
-    # ctypes 低速反馈转 LowSpeedFeedback
-    return LowSpeedFeedback(
-        bus_voltage_v=float(raw.bus_voltage_v),
-        driver_temp_deg=int(raw.driver_temp_deg),
-        motor_temp_deg=int(raw.motor_temp_deg),
-        bus_current=float(raw.bus_current),
-        status_raw=int(raw.status_raw),
-        status=_driver_status_from_ctypes(raw.status),
-        timestamp=_ns_to_timestamp(raw.timestamp_ns),
-    )
-
-
-def _version_from_ctypes(raw: _MotorVersionInfo) -> VersionInfo:
-    # ctypes 版本信息转 VersionInfo
-    return VersionInfo(
-        software=_c_string(bytes(raw.software)),
-        hardware=_c_string(bytes(raw.hardware)),
-        motor=_c_string(bytes(raw.motor)),
-        timestamp=_ns_to_timestamp(raw.timestamp_ns),
-    )
-
-
-def _motor_dynamic_lib_name() -> str:
-    # 当前平台的 libmotor 动态库文件名
-    if sys.platform == "win32":
-        return "motor.dll"
-    if sys.platform == "darwin":
-        return "libmotor.dylib"
-    return "libmotor.so"
-
-
-def _candidate_paths() -> List[Path]:
-    # libmotor 候选搜索路径
-    out: List[Path] = []
-    env = os.environ.get("AGXMOTOR_LIB")
-    if env:
-        out.append(Path(env))
-    out.append(Path(__file__).resolve().parent / _motor_dynamic_lib_name())
-    return out
-
-
-def _bind(lib: CDLL) -> None:
-    # 绑定 libmotor 的 ctypes 函数签名
-    h = c_void_p
-
-    lib.motor_create.restype = h
-    lib.motor_destroy.argtypes = [h]
-
-    lib.motor_set_tx_callback.argtypes = [h, TX_FN, c_void_p]
-    lib.motor_has_tx_callback.argtypes = [h]
-    lib.motor_has_tx_callback.restype = c_int
-
-    lib.motor_handle_rx_once.argtypes = [h, c_uint32, POINTER(c_uint8), c_uint8, c_uint64]
-    lib.motor_handle_rx_once.restype = c_int
-
-    lib.motor_get_high_speed_feedback.argtypes = [h, c_uint8, POINTER(_MotorHighSpeedFeedback)]
-    lib.motor_get_high_speed_feedback.restype = c_int
-    lib.motor_get_low_speed_feedback.argtypes = [h, c_uint8, POINTER(_MotorLowSpeedFeedback)]
-    lib.motor_get_low_speed_feedback.restype = c_int
-
-    lib.motor_set_target.argtypes = [h, c_uint8, c_float, c_uint8, c_float]
-    lib.motor_set_target.restype = c_int
-    lib.motor_set_enable.argtypes = [h, c_uint8, c_int, c_int, c_int]
-    lib.motor_set_enable.restype = c_int
-    lib.motor_set_reset.argtypes = [h, c_uint8, c_int, c_float, POINTER(c_int)]
-    lib.motor_set_reset.restype = c_int
-    lib.motor_set_clear_error.argtypes = [h, c_uint8, c_uint8, c_float, POINTER(c_int)]
-    lib.motor_set_clear_error.restype = c_int
-    lib.motor_set_zero_offset.argtypes = [h, c_uint8, c_float, c_int, c_float, POINTER(c_int)]
-    lib.motor_set_zero_offset.restype = c_int
-    lib.motor_set_profile_acc_dec.argtypes = [h, c_uint8, c_float, c_float]
-    lib.motor_set_profile_acc_dec.restype = c_int
-    lib.motor_set_profile_vel.argtypes = [h, c_uint8, c_float]
-    lib.motor_set_profile_vel.restype = c_int
-    lib.motor_set_current_limit.argtypes = [h, c_uint8, c_float]
-    lib.motor_set_current_limit.restype = c_int
-    lib.motor_set_mit_control.argtypes = [h, c_uint8, c_float, c_float, c_float, c_float, c_float, c_float]
-    lib.motor_set_mit_control.restype = c_int
-    lib.motor_set_mit_control_crc.argtypes = [h, c_uint8, c_float, c_float, c_float, c_float, c_float, c_float]
-    lib.motor_set_mit_control_crc.restype = c_int
-    lib.motor_set_collision_threshold.argtypes = [h, c_uint8, c_float, c_float]
-    lib.motor_set_collision_threshold.restype = c_int
-
-    lib.motor_get_param.argtypes = [h, c_uint8, c_uint8, c_uint8, c_float, POINTER(c_float)]
-    lib.motor_get_param.restype = c_int
-    lib.motor_set_param.argtypes = [h, c_uint8, c_uint8, c_uint8, c_float, c_float]
-    lib.motor_set_param.restype = c_int
-    lib.motor_get_version.argtypes = [h, c_uint8, c_float, POINTER(_MotorVersionInfo)]
-    lib.motor_get_version.restype = c_int
-
-
-def _motor_library_load_error() -> Optional[str]:
-    # 返回最近一次 libmotor 加载失败的错误信息
-    if _motor_lib_error is None:
-        return None
-    return str(_motor_lib_error)
-
-
-def _load_motor_library(path: Optional[Union[str, Path]] = None) -> Optional[CDLL]:
-    # 加载 libmotor 并绑定 ctypes 符号
-    global _motor_lib, _motor_lib_error
-    candidates = [Path(path)] if path else list(_candidate_paths())
-    last_err: Optional[BaseException] = None
-    for p in candidates:
-        try:
-            if not p.is_file():
-                continue
-            lib = CDLL(str(p))
-            _bind(lib)
-            _motor_lib = lib
-            _motor_lib_error = None
-            return lib
-        except OSError as e:
-            last_err = e
-    _motor_lib_error = last_err or FileNotFoundError(
-        "{0} not found (set AGXMOTOR_LIB or install libmotor)".format(_motor_dynamic_lib_name())
-    )
-    _motor_lib = None
-    return None
-
-
-def _get_motor_library() -> Optional[CDLL]:
-    # 返回进程内缓存的 libmotor，必要时自动加载
-    global _motor_lib
-    if _motor_lib is not None:
-        return _motor_lib
-    return _load_motor_library()
-
-
-def _message_timestamp(msg: Message) -> float:
-    # CAN msg timestamp [s], ns precision
-    ts = getattr(msg, "timestamp", None)
-    if ts is not None:
-        return float(ts)
-    return time.time_ns() * 1e-9
-
-
-class Motor:
-    """电机控制器。"""
+from ._motor_common import (
+    TX_FN,
+    TxCallback,
+    DriverStatus,
+    HighSpeedFeedback,
+    LowSpeedFeedback,
+    VersionInfo,
+    _arm_cache,
+    _MotorHighSpeedFeedback,
+    _MotorLowSpeedFeedback,
+    _MotorVersionInfo,
+    high_speed_from_ctypes,
+    low_speed_from_ctypes,
+    version_from_ctypes,
+    message_timestamp,
+    timestamp_to_ns,
+)
+
+class ArmMotor:
+    """机械臂关节电机（libmotor_arm）。"""
 
     class MotorParam(Enum):
         """电机参数索引（两字节 ASCII，对应 ``get_param`` / ``set_param``）。
@@ -424,9 +89,11 @@ class Motor:
         self._tx_cb: Optional[TxCallback] = None
         self._can_comm: Optional[CanComm] = None
 
-        lib = _get_motor_library()
+        lib = _arm_cache.get()
         if lib is None:
-            raise RuntimeError("libmotor not available: {0}".format(_motor_library_load_error() or "unknown error"))
+            raise RuntimeError(
+                "libmotor_arm not available: {0}".format(_arm_cache.load_error() or "unknown error")
+            )
         self._lib = lib
         self._handle = lib.motor_create()
         if not self._handle:
@@ -560,13 +227,13 @@ class Motor:
             data = msg.data
             dlc = len(msg.data)
             if timestamp is None:
-                timestamp = _message_timestamp(msg)
+                timestamp = message_timestamp(msg)
         if id is None or data is None:
             raise ValueError("need msg= or (id, data)")
         n = int(dlc) if dlc is not None else len(data)
         raw = data if isinstance(data, (bytes, bytearray)) else bytes(data)
         arr = (c_uint8 * max(n, 1))(*raw[:n]) if n > 0 else (c_uint8 * 1)()
-        ts = c_uint64(_timestamp_to_ns(timestamp) if timestamp is not None else 0)
+        ts = c_uint64(timestamp_to_ns(timestamp) if timestamp is not None else 0)
         return bool(
             self._lib.motor_handle_rx_once(
                 self._handle, c_uint32(id), cast(arr, POINTER(c_uint8)), c_uint8(n), ts
@@ -590,7 +257,7 @@ class Motor:
         out = _MotorHighSpeedFeedback()
         if not self._lib.motor_get_high_speed_feedback(self._handle, node_id, byref(out)):
             return None
-        return _high_speed_from_ctypes(out)
+        return high_speed_from_ctypes(out)
 
     def get_low_speed_feedback(self, node_id: int) -> Optional[LowSpeedFeedback]:
         """
@@ -609,7 +276,7 @@ class Motor:
         out = _MotorLowSpeedFeedback()
         if not self._lib.motor_get_low_speed_feedback(self._handle, node_id, byref(out)):
             return None
-        return _low_speed_from_ctypes(out)
+        return low_speed_from_ctypes(out)
 
     def _set_target(self, node_id: int, value: float, mode: int, timeout: float = 0.0) -> bool:
         return bool(self._lib.motor_set_target(self._handle, node_id, value, mode, timeout))
@@ -755,7 +422,11 @@ class Motor:
         return True
 
     def set_zero_offset(
-        self, node_id: int, zero_offset_rad: float, save_to_flash: bool, timeout: float = 1.0
+        self,
+        node_id: int,
+        zero_offset: float = 0.0,
+        save_to_flash: bool = False,
+        timeout: float = 1.0,
     ) -> bool:
         """
         设置机械零点偏移。
@@ -764,10 +435,10 @@ class Motor:
         ----
         node_id : int
             节点编号（1–15）。
-        zero_offset_rad : float
-            零点偏移 [rad]。
-        save_to_flash : bool
-            是否写入非易失存储。
+        zero_offset : float, optional
+            零点偏移 [rad]；默认 ``0.0`` 表示在当前位置标零、不附加偏移。
+        save_to_flash : bool, optional
+            是否写入非易失存储；默认 ``False``。
         timeout : float, optional
             阻塞应答时间 [s]。
 
@@ -780,7 +451,7 @@ class Motor:
         if not self._lib.motor_set_zero_offset(
             self._handle,
             node_id,
-            float(zero_offset_rad),
+            float(zero_offset),
             int(save_to_flash),
             float(timeout),
             byref(out_ok),
@@ -963,7 +634,7 @@ class Motor:
         node_id : int
             节点编号（1–15）。
         param : MotorParam
-            参数类型，例如 ``Motor.MotorParam.VV`` [rad/s]。
+            参数类型，例如 ``ArmMotor.MotorParam.VV`` [rad/s]。
         timeout : float, optional
             阻塞应答时间 [s]。
 
@@ -971,7 +642,7 @@ class Motor:
         ----
         float | None
             成功返回参数值，超时或发送失败为 None。
-            量纲见 :class:`Motor.MotorParam`。
+            量纲见 :class:`ArmMotor.MotorParam`。
         """
         idx1, idx2 = param.value
         out = c_float()
@@ -988,9 +659,9 @@ class Motor:
         node_id : int
             节点编号（1–15）。
         param : MotorParam
-            参数类型，例如 ``Motor.MotorParam.VV`` [rad/s]。
+            参数类型，例如 ``ArmMotor.MotorParam.VV`` [rad/s]。
         value : float
-            参数值；量纲见 ``Motor.MotorParam``。
+            参数值；量纲见 ``ArmMotor.MotorParam``。
         timeout : float, optional
             阻塞应答时间 [s]。
 
@@ -1023,13 +694,14 @@ class Motor:
         out = _MotorVersionInfo()
         if not self._lib.motor_get_version(self._handle, node_id, float(timeout), byref(out)):
             return None
-        return _version_from_ctypes(out)
+        return version_from_ctypes(out)
+
 
 
 __all__ = [
+    "ArmMotor",
     "DriverStatus",
     "HighSpeedFeedback",
     "LowSpeedFeedback",
-    "Motor",
     "VersionInfo",
 ]

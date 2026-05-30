@@ -1,4 +1,4 @@
-"""Install hook: fetch or verify prebuilt libmotor before build_py/develop."""
+"""Install hook: fetch or verify prebuilt libmotor_arm / libmotor_chassis before build_py/develop."""
 import hashlib
 import json
 import os
@@ -6,13 +6,14 @@ import platform
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 _ROOT = Path(__file__).resolve().parent
 _SHA256_MARKER = "AGXMOTOR_CTRL_LIBMOTOR_SHA256"
+_VARIANTS = ("arm", "chassis")
 
 
 def _read_version() -> str:
@@ -46,17 +47,17 @@ def _host_platform_arch() -> Tuple[str, str]:
     return p, a
 
 
-def _dest_filename() -> str:
+def _dest_filename(variant: str) -> str:
     if sys.platform == "win32":
-        return "motor.dll"
+        return f"motor_{variant}.dll"
     if sys.platform == "darwin":
-        return "libmotor.dylib"
-    return "libmotor.so"
+        return f"libmotor_{variant}.dylib"
+    return f"libmotor_{variant}.so"
 
 
-def _release_asset_name(plat: str, arch: str) -> str:
+def _release_asset_name(variant: str, plat: str, arch: str) -> str:
     ext = {"win32": "dll", "darwin": "dylib"}.get(sys.platform, "so")
-    return f"libmotor-{plat}-{arch}.{ext}"
+    return f"libmotor-{variant}-{plat}-{arch}.{ext}"
 
 
 def _download_url(repo: str, version: str, asset_name: str) -> str:
@@ -108,9 +109,9 @@ def _http_get_bytes(url: str) -> bytes:
 
 def _raise_network_error(cause: Optional[BaseException] = None) -> None:
     raise RuntimeError(
-        "Cannot install agx_motor_ctrl: failed to download libmotor. "
-        "Set AGXMOTOR_SKIP_DOWNLOAD=1 and place the library under agx_motor_ctrl/motor/, "
-        "or set AGXMOTOR_LIB at runtime."
+        "Cannot install agx_motor_ctrl: failed to download libmotor binaries. "
+        "Set AGXMOTOR_SKIP_DOWNLOAD=1 and place libmotor_arm / libmotor_chassis under "
+        "agx_motor_ctrl/motor/, or set AGXMOTOR_ARM_LIB / AGXMOTOR_CHASSIS_LIB at runtime."
     ) from cause
 
 
@@ -130,8 +131,43 @@ def _download_bytes(url: str, version: str, plat: str, arch: str, asset: str) ->
     except (URLError, OSError) as e:
         _raise_network_error(e)
     if not data:
-        raise RuntimeError("Downloaded libmotor is empty.")
+        raise RuntimeError(f"Downloaded {asset} is empty.")
     return data
+
+
+def _ensure_variant(
+    variant: str,
+    plat: str,
+    arch: str,
+    version: str,
+    repo: str,
+    sha_map: Dict[str, Any],
+    dest_dir: Path,
+) -> None:
+    dest_file = dest_dir / _dest_filename(variant)
+    asset = _release_asset_name(variant, plat, arch)
+    url = _download_url(repo, version, asset)
+    has_local = dest_file.is_file() and dest_file.stat().st_size > 0
+
+    expected = sha_map.get(asset)
+    if isinstance(expected, str):
+        expected = expected.strip().lower()
+    else:
+        expected = None
+
+    if expected and has_local and _sha256_file(dest_file).lower() == expected:
+        print(f"agx_motor_ctrl: local {dest_file.name} matches release metadata, skip download.")
+        return
+
+    if expected or not has_local:
+        print(f"agx_motor_ctrl: downloading {asset}: {url}")
+        data = _download_bytes(url, version, plat, arch, asset)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_file.write_bytes(data)
+        print(f"agx_motor_ctrl: wrote {dest_file} ({len(data)} bytes).")
+        return
+
+    print(f"agx_motor_ctrl: using local {dest_file.name}")
 
 
 def download_motor_if_needed() -> None:
@@ -141,34 +177,13 @@ def download_motor_if_needed() -> None:
 
     plat, arch = _host_platform_arch()
     dest_dir = _ROOT / "agx_motor_ctrl" / "motor"
-    dest_file = dest_dir / _dest_filename()
     version = _read_version()
     repo = os.environ.get("AGXMOTOR_GITHUB_REPO", "kehuanjack/agx_motor_ctrl").strip()
-    asset = _release_asset_name(plat, arch)
     tag = f"v{version}"
-    url = _download_url(repo, version, asset)
-    has_local = dest_file.is_file() and dest_file.stat().st_size > 0
-
     sha_map = _parse_sha256_map(_fetch_release_body(repo, tag))
-    expected = sha_map.get(asset)
-    if isinstance(expected, str):
-        expected = expected.strip().lower()
-    else:
-        expected = None
 
-    if expected and has_local and _sha256_file(dest_file).lower() == expected:
-        print(f"agx_motor_ctrl: local libmotor matches release metadata, skip download.")
-        return
-
-    if expected or not has_local:
-        print(f"agx_motor_ctrl: downloading libmotor: {url}")
-        data = _download_bytes(url, version, plat, arch, asset)
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest_file.write_bytes(data)
-        print(f"agx_motor_ctrl: wrote {dest_file} ({len(data)} bytes).")
-        return
-
-    print(f"agx_motor_ctrl: using local libmotor: {dest_file}")
+    for variant in _VARIANTS:
+        _ensure_variant(variant, plat, arch, version, repo, sha_map, dest_dir)
 
 
 def get_cmdclass() -> Dict[str, Any]:

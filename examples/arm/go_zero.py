@@ -1,10 +1,10 @@
 import time
 import threading
-from agx_motor_ctrl import CanComm, Motor, create_can_comm_config
+from agx_motor_ctrl import ArmMotor, CanComm, create_can_comm_config
 
 cfg = create_can_comm_config(channel="can0", interface="socketcan", auto_connect=True)
 bus = CanComm(cfg)
-motor = Motor(bus)
+motor = ArmMotor(bus)
 
 stop = threading.Event()
 
@@ -27,6 +27,8 @@ try:
     print(ver)
 
     print(motor.set_enable(node_id, True))
+    print(motor.set_profile_vel(node_id, 3.0))
+    print(motor.set_target_position(node_id, 0.0))
 finally:
     stop.set()
     motor.close()
